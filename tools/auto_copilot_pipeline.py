@@ -102,20 +102,22 @@ COPILOT_ASSIGNEES = ["@copilot", "copilot", "Copilot", "github-copilot", "github
 COPILOT_USERNAME = "copilot"
 
 # 轮询配置
-DEFAULT_POLL_INTERVAL = 60
-DEFAULT_MAX_WAIT = 10800  # 3小时（原为 24小时过长）
-DEFAULT_BATCH_SIZE = 1
-DEFAULT_TASK_MAX_RETRIES = 3
-DEFAULT_TASK_RETRY_WAIT = 300
-DEFAULT_MAX_PR_RESETS = 2  # 单个 Issue 内最大 PR 重置次数
-PR_TIMEOUT = 7200  # PR 处理超时（2小时）
-PR_WAIT_TIMEOUT = 1800  # 等待 PR 创建超时（30分钟）
+DEFAULT_POLL_INTERVAL = 60  # 秒
+DEFAULT_MAX_WAIT = 36000  # 单个 Issue 最大等待时间：10小时
+DEFAULT_BATCH_SIZE = 1  # 每个 Issue 包含的 TODO 数量（原子执行）
+DEFAULT_TASK_MAX_RETRIES = 3  # 任务失败重试次数
+DEFAULT_TASK_RETRY_WAIT = 300  # 任务重试等待时间：5分钟
+DEFAULT_MAX_PR_RESETS = 3  # 单个 Issue 内最大 PR 重置次数
+PR_TIMEOUT = 10800  # PR 处理超时：3小时
+PR_WAIT_TIMEOUT = 1800  # 等待 PR 创建超时：30分钟
 RESET_WAIT_TIME = 30  # 重置后的等待时间（秒）
 HEARTBEAT_INTERVAL = 300  # 长时间等待时的心跳日志间隔（秒）
-GH_TIMEOUT = 120  # GitHub CLI 命令超时（秒）
+GH_TIMEOUT = 180  # GitHub CLI 命令超时（秒），从 120 增加到 180
 RETRY_SLEEP_SHORT = 5  # 短暂重试等待（秒）
+NETWORK_ERROR_BASE_WAIT = 10  # 网络错误基础等待时间（秒）
+NETWORK_ERROR_MAX_WAIT = 120  # 网络错误最大等待时间（秒）
 PR_READY_WAIT = 2  # PR 标记 Ready 后等待时间（秒）
-MAIN_ERROR_WAIT = 300  # 主循环错误重试等待（秒）
+MAIN_ERROR_WAIT = 30  # 主循环错误重试等待（秒）
 TIMELINE_ACCEPT_HEADER = "Accept: application/vnd.github.mockingbird-preview+json"
 
 CORE_DOCUMENTS = {
@@ -251,18 +253,6 @@ ISSUE_BODY_TEMPLATE = """## 📋 任务概览
 
 ---
 
-## 🔗 关联 Issue
-
-**重要**：请在 PR 描述的**第一行**添加：
-
-```
-Fixes #{{issue_number}}
-```
-
-这样 PR 合并后会自动关闭此 Issue。
-
----
-
 ## 📚 参考文件
 
 {reference_files}
@@ -308,31 +298,46 @@ class GitHubClient:
                 return result.stdout.strip()
             except subprocess.TimeoutExpired:
                 if attempt == retries:
+                    logger.error(f"gh 命令最终超时失败（{retries} 次尝试）: {' '.join(args[:3])}...")
                     raise RuntimeError(f"gh 命令超时: {' '.join(args)}")
-                wait_time = min(2 ** attempt, 30)  # 最多等待 30 秒
-                logger.warning(f"gh 命令超时，{wait_time}秒后重试 ({attempt}/{retries})")
+                wait_time = min(2 ** attempt * NETWORK_ERROR_BASE_WAIT, NETWORK_ERROR_MAX_WAIT)
+                logger.warning(f"gh 命令超时，{wait_time}秒后重试 ({attempt}/{retries}): {' '.join(args[:3])}...")
                 time.sleep(wait_time)
             except subprocess.CalledProcessError as exc:
                 stderr = exc.stderr.strip() if exc.stderr else "无错误信息"
 
+                # 检测网络相关错误
+                NETWORK_ERRORS = {"tls handshake", "bad gateway", "connection reset",
+                                 "connection refused", "network", "timeout", "eof",
+                                 "502", "503", "504"}
+                is_network_error = any(keyword in stderr.lower() for keyword in NETWORK_ERRORS)
+
                 # 最后一次尝试，直接抛出异常
                 if attempt == retries:
+                    error_type = "网络错误" if is_network_error else "命令错误"
+                    logger.error(f"gh {error_type}最终失败（{retries} 次尝试）: {stderr[:200]}")
                     raise RuntimeError(f"gh 命令失败: {stderr}") from exc
 
                 # 某些错误不值得重试（立即失败）
                 if "not found" in stderr.lower() or "unknown" in stderr.lower():
+                    logger.error(f"gh 命令致命错误（不可重试）: {stderr}")
                     raise RuntimeError(f"gh 命令错误: {stderr}") from exc
 
                 # 针对 Rate Limit 的特殊处理
                 if "rate limit" in stderr.lower() or "abuse" in stderr.lower():
                     wait_time = min(300 * attempt, 1800)  # 最多等待 30 分钟
-                    logger.warning(f"GitHub API 限流警告，暂停 {wait_time} 秒后重试 ({attempt}/{retries})")
+                    logger.warning(f"GitHub API 限流警告，暂停 {wait_time}秒 ({wait_time/60:.1f}min) 后重试 ({attempt}/{retries})")
+                    time.sleep(wait_time)
+                # 网络错误使用指数退避
+                elif is_network_error:
+                    wait_time = min(2 ** attempt * NETWORK_ERROR_BASE_WAIT, NETWORK_ERROR_MAX_WAIT)
+                    logger.warning(f"网络错误，{wait_time}秒后重试 ({attempt}/{retries}): {stderr[:100]}")
                     time.sleep(wait_time)
                 else:
                     wait_time = min(2 ** attempt, 30)
-                    logger.warning(f"gh 命令失败，{wait_time}秒后重试 ({attempt}/{retries}): {stderr}")
+                    logger.warning(f"gh 命令失败，{wait_time}秒后重试 ({attempt}/{retries}): {stderr[:100]}")
                     time.sleep(wait_time)
-        # 注：正常情况下不会走到这里，因为最后一次重试失败会抛异常
+
         raise RuntimeError(f"gh 命令失败：未知错误 (重试 {retries} 次后仍失败)")
 
     def api_request(self, method: str, path: str, headers: Optional[List[str]] = None,
@@ -400,6 +405,19 @@ class GitHubClient:
         if last_error:
             raise RuntimeError(f"无法分配 Issue #{issue_number} 给 Copilot（已尝试 {len(assignees)} 个名称）: {last_error}") from last_error
 
+    def remove_assignees(self, issue_number: int, assignees: List[str]) -> None:
+        """取消分配 Issue 的指定用户/Bot"""
+        for assignee in assignees:
+            try:
+                self._run_gh([
+                    "issue", "edit", str(issue_number),
+                    "--repo", self.repo_ref, "--remove-assignee", assignee
+                ])
+                logger.debug(f"成功取消分配 Issue #{issue_number} 的 {assignee}")
+            except Exception as e:
+                # 取消分配失败不是致命错误，可能该用户本来就没分配
+                logger.debug(f"取消分配 {assignee} 失败（可能未分配）: {e}")
+
     def comment_issue(self, issue_number: int, body: str) -> None:
         self._run_gh(["issue", "comment", str(issue_number), "--repo", self.repo_ref, "--body", body])
 
@@ -436,7 +454,12 @@ class GitHubClient:
         return {"merged": True}
 
     def close_pr(self, pr_number: int, delete_branch: bool = True) -> None:
-        """关闭 PR 并可选删除分支"""
+        """关闭 PR 并可选删除分支
+
+        注意：关闭 PR（未合并）不会自动关闭关联的 Issue，
+        即使 PR 描述中包含 'Fixes #123'。
+        只有合并 PR 才会触发 Issue 的自动关闭。
+        """
         args = ["pr", "close", str(pr_number), "--repo", self.repo_ref]
         if delete_branch:
             args.append("--delete-branch")
@@ -505,10 +528,21 @@ class GitHubClient:
         return None
 
     def mark_pr_ready(self, pr_number: int) -> None:
+        """将 PR 标记为 Ready 状态
+
+        注意：此方法会将 Draft PR 或 "Ready for Review" 状态的 PR 转为 Ready。
+        如果 PR 已经是 Ready 状态，命令可能会失败，这是正常行为。
+        """
         try:
             self._run_gh(["pr", "ready", str(pr_number), "--repo", self.repo_ref])
+            logger.debug(f"成功调用 gh pr ready #{pr_number}")
         except Exception as e:
-            logger.warning(f"标记 PR #{pr_number} 为 Ready 失败: {e}")
+            error_msg = str(e).lower()
+            # 如果错误信息表明 PR 已经 ready，这不是真正的错误
+            if "already" in error_msg or "not a draft" in error_msg:
+                logger.debug(f"PR #{pr_number} 已处于 Ready 状态")
+            else:
+                logger.warning(f"标记 PR #{pr_number} 为 Ready 失败: {e}")
 
 # ==================== PR 监控 ====================
 
@@ -790,44 +824,32 @@ class Pipeline:
 
         github = self._require_github()
         existing = github.find_issue_by_todo(item.id_full)
+
+        # 尝试复用已有的 open Issue
         if existing:
             logger.info(f"检测到线上已有 Issue #{existing}")
-            # 检查 Issue 状态
             try:
                 issue_data = github.get_issue(existing)
                 state = issue_data.get('state')
                 logger.debug(f"Issue #{existing} 状态: {state}")
 
-                # 如果 Issue 已关闭，不复用，跳出并创建新的
-                if state == "closed":
-                    logger.warning(f"Issue #{existing} 已关闭，将创建新 Issue")
-                    # 显式跳过复用，设置 existing 为 None，下面的代码会创建新 Issue
-                    existing = None
-                elif state == "open":
-                    # Issue 仍然 open，检查并确保 Copilot 分配
+                if state == "open":
+                    # Issue 是 open 状态，确保 Copilot 已分配
                     assignees = {
                         (assignee.get("login") or "").lower()
                         for assignee in issue_data.get("assignees", []) if assignee
                     }
                     if COPILOT_USERNAME not in assignees:
-                        # 分配失败是严重错误，必须抛出异常以触发重试
                         github.add_assignees(existing, COPILOT_ASSIGNEES)
                         logger.info(f"✓ 已将 Issue #{existing} 重新分配给 Copilot")
                     else:
                         logger.debug(f"Issue #{existing} 已分配给 Copilot，直接复用")
                     return existing
                 else:
-                    # 未知状态，记录并创建新 Issue
-                    logger.warning(f"Issue #{existing} 状态未知: {state}，将创建新 Issue")
-                    existing = None
+                    # Issue 已关闭或未知状态，创建新的
+                    logger.warning(f"Issue #{existing} 状态为 {state}，将创建新 Issue")
             except Exception as e:
                 logger.warning(f"获取 Issue #{existing} 详情失败: {e}，将创建新 Issue")
-                existing = None
-
-        # 如果 existing 仍然有效，说明已经返回了，不应该走到这里
-        # 这个检查是防御性编程，确保逻辑一致性
-        if existing:
-            logger.warning(f"逻辑错误：existing={existing} 但未提前返回，将创建新 Issue")
 
         # 构建 Issue Body
         body = self._build_body(item)
@@ -985,17 +1007,21 @@ class Pipeline:
                     time.sleep(RESET_WAIT_TIME)
                     continue
 
-                # 条件1：检测到完成信号，合并 PR
+                # 条件1：检测到完成信号，立即标记为 ready 并合并 PR
                 if check_copilot_signal(github, pr_num):
                     logger.info(f"✓ 检测到 copilot_work_finished 信号")
 
-                    if pr.get("draft"):
-                        try:
-                            github.mark_pr_ready(pr_num)
-                            logger.info(f"已将 PR #{pr_num} 标记为 Ready")
-                            time.sleep(PR_READY_WAIT)
-                        except Exception as e:
-                            logger.warning(f"标记 Ready 失败: {e}")
+                    # 关键修复：无论当前状态如何，都尝试标记为 ready
+                    # 因为 Copilot 完成后 PR 可能处于 "ready for review" 状态
+                    # 需要显式调用 gh pr ready 才能合并
+                    logger.info(f"尝试将 PR #{pr_num} 标记为 Ready 状态...")
+                    try:
+                        github.mark_pr_ready(pr_num)
+                        logger.info(f"✓ 已将 PR #{pr_num} 标记为 Ready")
+                        time.sleep(PR_READY_WAIT)
+                    except Exception as e:
+                        # 如果 PR 已经是 ready 状态，命令可能会失败，这是正常的
+                        logger.debug(f"标记 Ready 时出现异常（可能 PR 已是 Ready 状态）: {e}")
 
                     try:
                         github.merge_pull(pr_num)
@@ -1019,6 +1045,14 @@ class Pipeline:
                         # 触发重置，让 Copilot 重新处理
                         logger.warning(f"将重置流程并让 Copilot 重试 (第 {reset_count + 1}/{DEFAULT_MAX_PR_RESETS} 次)")
                         try:
+                            merge_fail_comment = f"""❌ **PR 合并失败**
+
+错误信息：{str(e)[:200]}
+
+已关闭此 PR 并触发 Issue #{issue_num} 的重置流程。
+重置次数：{reset_count + 1}/{DEFAULT_MAX_PR_RESETS}
+"""
+                            github.comment_issue(pr_num, merge_fail_comment)
                             github.close_pr(pr_num, delete_branch=True)
                         except Exception:
                             pass  # 关闭失败也继续
@@ -1035,22 +1069,33 @@ class Pipeline:
                     elapsed = time.time() - pr_create_time
                     if elapsed > PR_TIMEOUT:
                         if reset_count >= DEFAULT_MAX_PR_RESETS:
+                            logger.error(f"PR #{pr_num} 超时 ({elapsed/3600:.1f}h)，已达最大重置次数")
                             raise RuntimeError(f"PR 超时且重置次数已达上限 ({DEFAULT_MAX_PR_RESETS})，Issue #{issue_num} 需要人工介入")
 
-                        logger.warning(f"PR #{pr_num} 超时 ({elapsed/3600:.1f}h)，重置流程 (第 {reset_count + 1}/{DEFAULT_MAX_PR_RESETS} 次)")
+                        logger.warning(f"PR #{pr_num} 超时 ({elapsed/3600:.1f}h / {PR_TIMEOUT/3600:.1f}h)，准备重置流程 (第 {reset_count + 1}/{DEFAULT_MAX_PR_RESETS} 次)")
 
-                        # 关闭超时 PR
+                        # 关闭超时 PR（注意：关闭 PR 不会关闭 Issue，Issue 仍然保持 open）
                         try:
+                            # 先添加评论说明超时原因，方便后期审计
+                            timeout_comment = f"""🕒 **PR 超时自动关闭**
+
+Copilot 处理时间超过 {PR_TIMEOUT/3600:.1f} 小时，自动关闭此 PR。
+已触发 Issue #{issue_num} 的重置流程，Copilot 将重新处理任务。
+
+重置次数：{reset_count + 1}/{DEFAULT_MAX_PR_RESETS}
+"""
+                            github.comment_issue(pr_num, timeout_comment)  # PR 也是一种 Issue
                             github.close_pr(pr_num, delete_branch=True)
-                            logger.info(f"✓ 已关闭超时 PR #{pr_num}")
+                            logger.info(f"✓ 已关闭超时 PR #{pr_num} 并添加说明评论")
                         except Exception as e:
-                            logger.warning(f"关闭 PR 失败: {e}")
+                            logger.warning(f"关闭 PR 失败（继续执行重置）: {e}")
 
                         self._reset_issue(github, issue_num)
                         reset_count += 1
                         current_pr = None
                         pr_create_time = None
                         wait_start_time = time.time()
+                        logger.info(f"已触发重置，等待 {RESET_WAIT_TIME} 秒后继续监控")
                         time.sleep(RESET_WAIT_TIME)
                         continue
 
@@ -1058,21 +1103,25 @@ class Pipeline:
             current_time = time.time()
             if current_time - last_heartbeat >= HEARTBEAT_INTERVAL:
                 elapsed_mins = (current_time - issue_start_time) / 60
-                reset_info = f" [重置:{reset_count}/{DEFAULT_MAX_PR_RESETS}]" if reset_count > 0 else ""
+                reset_suffix = f" [重置:{reset_count}/{DEFAULT_MAX_PR_RESETS}]" if reset_count > 0 else ""
+
                 if pr_num and pr_create_time:
                     pr_elapsed = (current_time - pr_create_time) / 60
-                    status = f"等待信号 (PR #{pr_num}, {pr_elapsed:.1f}min/{PR_TIMEOUT/60:.0f}min){reset_info}"
+                    pr_remaining = (PR_TIMEOUT - (current_time - pr_create_time)) / 60
+                    indicator = "⏰" if pr_remaining < 30 else "⏳"
+                    status = f"等待信号 (PR #{pr_num}, {pr_elapsed:.0f}/{PR_TIMEOUT/60:.0f}min, 剩余{pr_remaining:.0f}min){reset_suffix} {indicator}"
                 else:
-                    # 没有 PR 或 PR 刚创建，显示等待时间
                     wait_elapsed = (current_time - wait_start_time) / 60
-                    status = f"等待 PR ({wait_elapsed:.1f}min/{PR_WAIT_TIMEOUT/60:.0f}min){reset_info}"
-                logger.info(f"[{elapsed_mins:.1f}min] {status}")
+                    wait_remaining = (PR_WAIT_TIMEOUT - (current_time - wait_start_time)) / 60
+                    status = f"等待 PR ({wait_elapsed:.0f}/{PR_WAIT_TIMEOUT/60:.0f}min, 剩余{wait_remaining:.0f}min){reset_suffix}"
+
+                logger.info(f"💓 [{elapsed_mins:.0f}min] {status}")
                 last_heartbeat = current_time
 
             time.sleep(self.args.poll_interval)
 
     def _reset_issue(self, github: GitHubClient, issue_num: int) -> None:
-        """重置 Issue：确保 Copilot 分配并添加触发评论"""
+        """重置 Issue：通过 unassign + assign 触发 Copilot 重新处理"""
         try:
             # 检查 Issue 状态，如果已关闭则不重置
             issue_data = github.get_issue(issue_num)
@@ -1080,24 +1129,24 @@ class Pipeline:
                 logger.warning(f"Issue #{issue_num} 已关闭，跳过重置")
                 return
 
-            # 优先确保 Copilot 已分配（Assignment 是主要触发机制）
+            # 获取当前分配的用户列表
             assignees = {
                 (assignee.get("login") or "").lower()
                 for assignee in issue_data.get("assignees", []) if assignee
             }
-            if COPILOT_USERNAME not in assignees:
-                github.add_assignees(issue_num, COPILOT_ASSIGNEES)
-                logger.info(f"✓ 重新分配 Issue #{issue_num} 给 Copilot")
-            else:
-                logger.debug(f"Copilot 已分配到 Issue #{issue_num}")
 
-            # 添加评论作为辅助触发（可选）
-            trigger_comment = (
-                "@copilot 请重新处理此任务。\n\n"
-                "上一次 PR 已超时或失败，请按照 Issue 描述重新执行完整流程。"
-            )
-            github.comment_issue(issue_num, trigger_comment)
-            logger.debug(f"已向 Issue #{issue_num} 添加重新触发评论")
+            # 关键修复：先 unassign Copilot（如果已分配），再重新 assign
+            # 这是触发 Copilot 重新处理的正确方式
+            if COPILOT_USERNAME in assignees:
+                logger.info(f"检测到 Copilot 已分配，先取消分配以触发重新处理")
+                github.remove_assignees(issue_num, COPILOT_ASSIGNEES)
+                time.sleep(2)  # 给 GitHub 一点时间处理 unassign
+
+            # 重新分配 Copilot
+            logger.info(f"重新分配 Issue #{issue_num} 给 Copilot")
+            github.add_assignees(issue_num, COPILOT_ASSIGNEES)
+            logger.info(f"✓ 已触发 Copilot 重新处理 Issue #{issue_num}")
+
         except Exception as e:
             logger.error(f"重置 Issue 失败: {e}")
             raise
