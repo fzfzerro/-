@@ -1,0 +1,54 @@
+name: Auto Copilot Pipeline
+
+on:
+  # 定时触发（每天早上 8 点）
+  schedule:
+    - cron: '0 8 * * *'
+  
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '是否为预览模式'
+        required: false
+        default: 'false'
+      from_beginning:
+        description: '是否从头开始（忽略已完成任务）'
+        required: false
+        default: 'false'
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Run auto_copilot_pipeline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 tools/auto_copilot_pipeline.py \
+            --poll-interval 60 \
+            --issue-batch-size 1 \
+            --task-max-retries 3
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline-logs
+          path: pipeline.log
+          retention-days: 30
